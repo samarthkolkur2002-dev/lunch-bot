@@ -4,6 +4,7 @@ const multer = require('multer');
 require('dotenv').config();
 
 const { GoogleGenAI } = require('@google/genai');
+const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 const PORT = 3000;
@@ -11,32 +12,79 @@ const PORT = 3000;
 app.use(cors());
 app.use(express.json());
 
-// Set up multer to temporarily hold the uploaded menu photo in computer memory
 const upload = multer({ storage: multer.memoryStorage() });
 
-// Initialize the Google Gemini AI using your secure key
+// Initialize the Gemini AI and Supabase Database
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-// Temporary database for our menus 
-let savedMenus = [
-  { id: 1, name: "Chicken Biryani", price: 250 },
-  { id: 2, name: "Paneer Butter Masala", price: 200 },
-  { id: 3, name: "Garlic Naan", price: 50 }
-];
+// ROUTE: Get a list of all saved restaurants
+app.get('/api/restaurants', async (req, res) => {
+  const { data, error } = await supabase
+    .from('restaurants')
+    .select('*')
+    .order('name', { ascending: true });
 
-// Route to get the menu
-app.get('/api/menu', (req, res) => {
-  res.json(savedMenus);
+  if (error) {
+    console.error("Database fetch error:", error);
+    return res.status(500).json({ error: 'Failed to fetch restaurants.' });
+  }
+  res.json(data);
 });
 
-// NEW ROUTE: AI Menu Scanner
+// ROUTE: Get menu items for a specific restaurant
+app.get('/api/menu', async (req, res) => {
+  const { restaurantId } = req.query;
+  
+  let query = supabase.from('menu_items').select('*').order('created_at', { ascending: false });
+  
+  if (restaurantId) {
+    query = query.eq('restaurant_id', restaurantId);
+  }
+
+  const { data, error } = await query;
+
+  if (error) {
+    console.error("Database fetch error:", error);
+    return res.status(500).json({ error: 'Failed to fetch menu.' });
+  }
+  res.json(data);
+});
+
+// ROUTE: AI Menu Scanner 
 app.post('/api/scan-menu', upload.single('menuImage'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'No image file uploaded.' });
     }
 
-    // Convert the uploaded image into the format Gemini expects
+    const restaurantName = req.body.restaurantName;
+    if (!restaurantName) {
+      return res.status(400).json({ error: 'Restaurant name is required.' });
+    }
+
+    // 1. Find or create the restaurant in the database
+    let restaurantId;
+    const { data: existingRest, error: searchError } = await supabase
+      .from('restaurants')
+      .select('id')
+      .ilike('name', restaurantName)
+      .single();
+
+    if (existingRest) {
+      restaurantId = existingRest.id;
+    } else {
+      const { data: newRest, error: insertError } = await supabase
+        .from('restaurants')
+        .insert([{ name: restaurantName }])
+        .select()
+        .single();
+        
+      if (insertError) throw insertError;
+      restaurantId = newRest.id;
+    }
+
+    // 2. Process image with Gemini
     const imagePart = {
       inlineData: {
         data: req.file.buffer.toString("base64"),
@@ -44,7 +92,6 @@ app.post('/api/scan-menu', upload.single('menuImage'), async (req, res) => {
       },
     };
 
-    // Ask Gemini AI to extract items and prices (UPDATED TO 3.6-FLASH)
     const response = await ai.models.generateContent({
       model: 'gemini-3.6-flash',
       contents: [
@@ -53,24 +100,57 @@ app.post('/api/scan-menu', upload.single('menuImage'), async (req, res) => {
       ]
     });
 
-    // Clean up and parse the AI's response text into a real JavaScript array
     let rawText = response.text.trim();
     rawText = rawText.replace(/```json/g, '').replace(/```/g, '').trim();
     const extractedItems = JSON.parse(rawText);
 
-    // Give each item a unique ID and add it to our menu list
-    savedMenus = extractedItems.map((item, index) => ({
-      id: Date.now() + index,
+    // 3. Attach the specific restaurant ID
+    const itemsToInsert = extractedItems.map(item => ({
       name: item.name,
-      price: Number(item.price)
+      price: Number(item.price),
+      restaurant_id: restaurantId
     }));
 
-    res.json({ success: true, menu: savedMenus });
+    // 4. Save to database
+    const { data: savedItems, error: menuError } = await supabase
+      .from('menu_items')
+      .insert(itemsToInsert)
+      .select();
+
+    if (menuError) throw menuError;
+
+    res.json({ success: true, menu: savedItems, restaurantId: restaurantId });
 
   } catch (error) {
     console.error("AI Scan Error:", error);
     res.status(500).json({ error: 'Failed to process menu image with AI.' });
   }
+});
+
+// NEW ROUTE: Submit a final order to the ledger
+app.post('/api/orders', async (req, res) => {
+  const { buyerName, restaurantId, cartItems, totalPrice } = req.body;
+
+  if (!buyerName || !restaurantId || !cartItems || cartItems.length === 0) {
+    return res.status(400).json({ error: 'Missing order details.' });
+  }
+
+  const { data, error } = await supabase
+    .from('orders')
+    .insert([{
+      buyer_name: buyerName,
+      restaurant_id: restaurantId,
+      cart_items: cartItems,
+      total_price: totalPrice
+    }])
+    .select();
+
+  if (error) {
+    console.error("Order database error:", error);
+    return res.status(500).json({ error: 'Failed to save order to database.' });
+  }
+
+  res.json({ success: true, order: data });
 });
 
 app.listen(PORT, () => {
