@@ -152,6 +152,22 @@ app.post('/api/orders', async (req, res) => {
 
   res.json({ success: true, order: data });
 });
+// NEW ROUTE: Delete a restaurant (and automatically cascade delete its menu)
+app.delete('/api/restaurants/:id', async (req, res) => {
+  const { id } = req.params;
+
+  const { error } = await supabase
+    .from('restaurants')
+    .delete()
+    .eq('id', id);
+
+  if (error) {
+    console.error("Delete error:", error);
+    return res.status(500).json({ error: 'Failed to delete restaurant.' });
+  }
+
+  res.json({ success: true });
+});
 
 app.listen(PORT, () => {
   console.log(`Server is purring at http://localhost:${PORT}`);
